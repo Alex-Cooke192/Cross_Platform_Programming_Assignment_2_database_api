@@ -219,14 +219,13 @@ def _upsert_inspection(incoming: Dict[str, Any]) -> Tuple[str, str]:
             connection.execute(
                 """
                 INSERT INTO inspections
-                    (id, aircraft_id, status, opened_at, completed_at, technician_id,
+                    (id, aircraft_id, opened_at, completed_at, technician_id,
                      created_at, updated_at, sync_status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'synced')
                 """,
                 (
                     insp_id,
                     incoming.get("aircraft_id"),
-                    incoming.get("status"),
                     incoming.get("opened_at"),
                     incoming.get("completed_at"),
                     incoming.get("technician_id"),
