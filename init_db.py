@@ -1,6 +1,9 @@
 from pathlib import Path
 import sqlite3
- 
+import os
+
+from seed_central_db import seed  
+
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "warehouse.db"
 SCHEMA_PATH = BASE_DIR / "schema.sql"
@@ -15,3 +18,8 @@ def init_db() -> None:
 if __name__ == "__main__":
     init_db()
     print(f"Initialized database at {DB_PATH}")
+
+    # DEV-ONLY: seed if requested
+    if os.environ.get("SEED_DB") == "1":
+        seed()
+        print("Seeded central database.")
