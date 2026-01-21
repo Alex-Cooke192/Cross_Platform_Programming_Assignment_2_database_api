@@ -17,5 +17,5 @@ def init_db() -> None:
 
 if __name__ == "__main__":
     init_db()
-    seed(DB_PATH)  # always seed the SAME db file
+    # seed(DB_PATH)  # always seed the SAME db file
     print(f"Initialized + seeded database at {DB_PATH}")

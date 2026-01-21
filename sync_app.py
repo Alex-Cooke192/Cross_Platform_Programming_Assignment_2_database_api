@@ -19,7 +19,7 @@ app = Flask(__name__)
 
 
 def get_connection() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH)
+    connection = sqlite3.connect(DB_PATH, isolation_level=None)  # autocommit
     connection.execute("PRAGMA foreign_keys = ON")
     connection.row_factory = sqlite3.Row
     return connection
@@ -121,6 +121,22 @@ def _upsert_technician(incoming: Dict[str, Any]) -> Tuple[str, str]:
     tech_id = incoming.get("id")
     if not tech_id:
         return ("skipped", "")
+    
+    if not incoming.get("username"):
+        name = (incoming.get("name") or "").strip()
+        if name:
+            incoming = {
+                **incoming,
+                "username": name,
+                "display_name": incoming.get("display_name") or name,
+            }
+        else:
+            # Last-resort fallback to satisfy NOT NULL constraint
+            incoming = {
+                **incoming,
+                "username": f"tech_{tech_id[:8]}",
+                "display_name": incoming.get("display_name") or f"tech_{tech_id[:8]}",
+            }
 
     server = _fetch_row_by_id("technicians_cache", tech_id)
     client_ts = _parse_ts(incoming.get("updated_at"))
@@ -220,8 +236,8 @@ def _upsert_inspection(incoming: Dict[str, Any]) -> Tuple[str, str]:
                 """
                 INSERT INTO inspections
                     (id, aircraft_id, opened_at, completed_at, technician_id,
-                     created_at, updated_at, sync_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'synced')
+                    created_at, updated_at, sync_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'synced')
                 """,
                 (
                     insp_id,
@@ -243,6 +259,10 @@ def _upsert_task(incoming: Dict[str, Any]) -> Tuple[str, str]:
     task_id = incoming.get("id")
     if not task_id:
         return ("skipped", "")
+    
+    if "is_complete" not in incoming and "is_completed" in incoming:
+        incoming = {**incoming, "is_complete": incoming.get("is_completed")}
+
 
     server = _fetch_row_by_id("tasks", task_id)
     client_ts = _parse_ts(incoming.get("updated_at"))
