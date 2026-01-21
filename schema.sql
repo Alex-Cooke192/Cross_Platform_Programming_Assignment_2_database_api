@@ -21,7 +21,6 @@ CREATE TABLE IF NOT EXISTS technicians_cache (
 CREATE TABLE IF NOT EXISTS inspections (
     id TEXT PRIMARY KEY,                 -- UUID
     aircraft_id TEXT NOT NULL,           -- e.g. 'G-ABCD'
-    status TEXT NOT NULL,                -- e.g. 'outstanding'|'in_progress'|'completed'
     opened_at TEXT,                      -- when inspection started
     completed_at TEXT,                   -- when inspection finished
 
@@ -56,6 +55,5 @@ CREATE TABLE IF NOT EXISTS tasks (
     FOREIGN KEY (inspection_id) REFERENCES inspections(id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_inspections_status ON inspections(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_inspection_id ON tasks(inspection_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_complete ON tasks(is_complete);
