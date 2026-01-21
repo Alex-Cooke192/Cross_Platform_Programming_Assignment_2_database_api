@@ -350,11 +350,19 @@ def sync_jobs():
     job_id = str(uuid4())
     server_time = _now_iso()
 
-    applied = {
+    applied_summary = {
         "technicians_cache": {"inserted": 0, "updated": 0, "skipped": 0, "conflict": 0},
         "inspections": {"inserted": 0, "updated": 0, "skipped": 0, "conflict": 0},
         "tasks": {"inserted": 0, "updated": 0, "skipped": 0, "conflict": 0},
     }
+
+    # NEW: IDs per outcome
+    applied_ids = {
+        "technicians_cache": {"inserted": [], "updated": [], "skipped": [], "conflict": []},
+        "inspections": {"inserted": [], "updated": [], "skipped": [], "conflict": []},
+        "tasks": {"inserted": [], "updated": [], "skipped": [], "conflict": []},
+    }
+
 
     conflicts = {
         "technicians_cache": [],
@@ -366,21 +374,36 @@ def sync_jobs():
     # technicians -> inspections -> tasks
     for t in tech_changes:
         result, rid = _upsert_technician(t or {})
-        applied["technicians_cache"][result] += 1
+        applied_summary["technicians_cache"][result] += 1
+
+        if rid:
+            applied_ids["technicians_cache"][result].append(rid)
+
         if result == "conflict" and rid:
             conflicts["technicians_cache"].append(rid)
 
+
     for i in insp_changes:
         result, rid = _upsert_inspection(i or {})
-        applied["inspections"][result] += 1
+        applied_summary["inspections"][result] += 1
+
+        if rid:
+            applied_ids["inspections"][result].append(rid)
+
         if result == "conflict" and rid:
             conflicts["inspections"].append(rid)
 
+
     for tk in task_changes:
         result, rid = _upsert_task(tk or {})
-        applied["tasks"][result] += 1
+        applied_summary["tasks"][result] += 1
+
+        if rid:
+            applied_ids["tasks"][result].append(rid)
+
         if result == "conflict" and rid:
             conflicts["tasks"].append(rid)
+
 
     # Pull server-side changes since last_sync_at 
     server_changes = {
@@ -393,8 +416,12 @@ def sync_jobs():
         {
             "job_id": job_id,
             "server_time": server_time,
-            "applied": applied,
+            "applied": applied_summary,
+            "applied_ids": applied_ids,
             "conflicts": conflicts,
             "server_changes": server_changes,
         }
     ), 200
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5050)
