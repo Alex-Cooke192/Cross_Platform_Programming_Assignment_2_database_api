@@ -78,8 +78,7 @@ def seed() -> None:
         opened_at = None if opened_at_dt is None else now_iso_z(opened_at_dt)
         completed_at = None if completed_at_dt is None else now_iso_z(completed_at_dt)
 
-        # NOTE: your local adapter doesn't send/receive "status" currently,
-        # but the server schema requires it, so we seed it here.
+        # Send sync status to local 
         cur.execute(
             """
             INSERT INTO inspections (
