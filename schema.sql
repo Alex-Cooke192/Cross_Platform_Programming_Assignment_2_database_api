@@ -30,7 +30,6 @@ CREATE TABLE IF NOT EXISTS inspections (
 
     -- sync metadata
     sync_status TEXT NOT NULL DEFAULT 'synced',
-    CHECK (status IN ('outstanding', 'in_progress', 'completed')),
     CHECK (sync_status IN ('synced', 'pending', 'conflict')),
     FOREIGN KEY (technician_id) REFERENCES technicians_cache(id) ON DELETE SET NULL
 );
