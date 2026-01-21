@@ -1,7 +1,7 @@
 from pathlib import Path
 import sqlite3
 
-from seed_central_db import seed  # we'll change seed() to accept a path
+from seed_central_db import seed  
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "warehouse.db"
