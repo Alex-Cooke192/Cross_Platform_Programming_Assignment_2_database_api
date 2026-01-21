@@ -1,5 +1,5 @@
 from uuid import uuid4
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 import sqlite3
 import os
@@ -66,7 +66,7 @@ def _parse_ts(ts: Optional[str]) -> datetime:
 
 def _now_iso() -> str:
     # Use ISO-ish text; consistent and sortable
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _fetch_row_by_id(table: str, row_id: str) -> Optional[Dict[str, Any]]:
