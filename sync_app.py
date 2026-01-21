@@ -2,6 +2,7 @@ from uuid import uuid4
 from datetime import datetime
 from functools import wraps
 import sqlite3
+import os
 from typing import Any, Dict, Optional, List, Tuple
 from flask import Flask, jsonify, request
 
@@ -11,13 +12,15 @@ from flask import Flask, jsonify, request
 # ----------------------------
 
 API_KEY = "api_warehouse_student_key_1234567890abcdef"
-DB_PATH = "warehouse.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "warehouse.db")
 
 app = Flask(__name__)
 
 
 def get_connection() -> sqlite3.Connection:
     connection = sqlite3.connect(DB_PATH)
+    connection.execute("PRAGMA foreign_keys = 0")
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -411,6 +414,11 @@ def sync_jobs():
         "inspections": _fetch_updated_since("inspections", last_sync_at),
         "tasks": _fetch_updated_since("tasks", last_sync_at),
     }
+
+    data = request.get_json(silent=True)
+    print("RAW JSON:", data)
+    print("RAW BODY:", request.data)
+
 
     return jsonify(
         {
