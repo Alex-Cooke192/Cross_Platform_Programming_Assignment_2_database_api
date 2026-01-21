@@ -20,7 +20,7 @@ app = Flask(__name__)
 
 def get_connection() -> sqlite3.Connection:
     connection = sqlite3.connect(DB_PATH)
-    connection.execute("PRAGMA foreign_keys = 0")
+    connection.execute("PRAGMA foreign_keys = ON")
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -195,7 +195,6 @@ def _upsert_inspection(incoming: Dict[str, Any]) -> Tuple[str, str]:
                 """
                 UPDATE inspections
                 SET aircraft_id = ?,
-                    status = ?,
                     opened_at = ?,
                     completed_at = ?,
                     technician_id = ?,
@@ -205,7 +204,6 @@ def _upsert_inspection(incoming: Dict[str, Any]) -> Tuple[str, str]:
                 """,
                 (
                     incoming.get("aircraft_id", server.get("aircraft_id")),
-                    incoming.get("status", server.get("status")),
                     incoming.get("opened_at", server.get("opened_at")),
                     incoming.get("completed_at", server.get("completed_at")),
                     incoming.get("technician_id", server.get("technician_id")),
