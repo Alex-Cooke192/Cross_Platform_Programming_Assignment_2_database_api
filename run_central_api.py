@@ -36,23 +36,17 @@ def run_api() -> int:
     env = os.environ.copy()
     env["WAREHOUSE_DB_PATH"] = str(DB_PATH)
 
-    return subprocess.call(
-        [
-            sys.executable,
-            "-m",
-            "uvicorn",
-            "api.main:app",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "8000",
-            "--reload",
-        ],
-        env=env,
-    )
+    return subprocess.call([sys.executable, "sync_app.py"], env=env)
 
+def reset_db() -> None:
+    if DB_PATH.exists():
+        DB_PATH.unlink()
+        print(f"Deleted {DB_PATH}")
 
 def main() -> int:
+    print("Resetting database...")
+    reset_db()
+    
     print("Initialising database schema...")
     init_db()
 
