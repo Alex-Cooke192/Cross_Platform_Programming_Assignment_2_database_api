@@ -33,6 +33,7 @@ def seed() -> None:
     cur = conn.cursor()
 
     if WIPE_FIRST:
+        # Order matters due to FKs (tasks -> inspections -> technicians_cache)
         cur.execute("DELETE FROM tasks;")
         cur.execute("DELETE FROM inspections;")
         cur.execute("DELETE FROM technicians_cache;")
@@ -44,33 +45,54 @@ def seed() -> None:
     updated_at = created_at
 
     # ---- Technicians ----
-    tech_names = ["tech.jane", "tech.ali", "tech.sam", "tech.rory", "tech.mina"]
-    tech_ids: list[str] = []
+    tech_usernames = ["tech.jane", "tech.ali", "tech.sam", "tech.rory", "tech.mina"]
 
-    for name in tech_names:
+    for username in tech_usernames:
         tid = str(uuid4())
-        tech_ids.append(tid)
+
+        display_name = username.replace("tech.", "").capitalize()
+
         cur.execute(
             """
-            INSERT INTO technicians_cache (id, name, created_at, updated_at, sync_status)
-            VALUES (?, ?, ?, ?, 'synced')
+            INSERT OR IGNORE INTO technicians_cache (
+            id, username, display_name, role,
+            created_at, updated_at, sync_status
+            )
+            VALUES (?, ?, ?, 'technician', ?, ?, 'synced')
             """,
-            (tid, name, created_at, updated_at),
+            (tid, username, display_name, created_at, updated_at),
         )
 
+    # IMPORTANT: fetch real IDs (source of truth) so FKs never break
+    placeholders = ",".join("?" for _ in tech_usernames)
+    rows = cur.execute(
+        f"SELECT id FROM technicians_cache WHERE username IN ({placeholders}) ORDER BY username",
+        tech_usernames,
+    ).fetchall()
+
+    tech_ids = [r["id"] for r in rows]
+
+    if len(tech_ids) != len(tech_usernames):
+        raise RuntimeError(
+            f"Expected {len(tech_usernames)} technicians, found {len(tech_ids)}. "
+            "Check seeding or existing DB state."
+        )
+
+
     # ---- Inspections ----
+    # Schema has no "status" column; derive status locally from opened_at/completed_at.
     seeded_inspections = [
-        ("G-ABCD", None, None, 0, "outstanding"),
-        ("G-EFGH", None, None, 0, "outstanding"),
-        ("G-IJKL", now - timedelta(hours=6), None, 0, "in_progress"),
-        ("G-MNOP", now - timedelta(hours=4), None, 0, "in_progress"),
-        ("G-QRST", now - timedelta(hours=2), None, 0, "in_progress"),
-        ("G-UVWX", now - timedelta(days=1, hours=3), now - timedelta(days=1, hours=1), 1, "completed"),
-        ("G-YZ12", now - timedelta(days=2, hours=5), now - timedelta(days=2, hours=2), 1, "completed"),
+        ("G-ABCD", None, None, 0),  # outstanding
+        ("G-EFGH", None, None, 0),  # outstanding
+        ("G-IJKL", now - timedelta(hours=6), None, 0),  # in_progress
+        ("G-MNOP", now - timedelta(hours=4), None, 0),  # in_progress
+        ("G-QRST", now - timedelta(hours=2), None, 0),  # in_progress
+        ("G-UVWX", now - timedelta(days=1, hours=3), now - timedelta(days=1, hours=1), 1),  # completed
+        ("G-YZ12", now - timedelta(days=2, hours=5), now - timedelta(days=2, hours=2), 1),  # completed
     ]
 
     inspection_ids: list[str] = []
-    for i, (aircraft_id, opened_at_dt, completed_at_dt, is_completed, status) in enumerate(seeded_inspections):
+    for i, (aircraft_id, opened_at_dt, completed_at_dt, is_completed) in enumerate(seeded_inspections):
         iid = str(uuid4())
         inspection_ids.append(iid)
 
@@ -78,16 +100,15 @@ def seed() -> None:
         opened_at = None if opened_at_dt is None else now_iso_z(opened_at_dt)
         completed_at = None if completed_at_dt is None else now_iso_z(completed_at_dt)
 
-        # Send sync status to local 
         cur.execute(
             """
             INSERT INTO inspections (
-              id, aircraft_id, status, opened_at, completed_at,
+              id, aircraft_id, opened_at, completed_at,
               technician_id, created_at, updated_at, sync_status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'synced')
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'synced')
             """,
-            (iid, aircraft_id, status, opened_at, completed_at, technician_id, created_at, updated_at),
+            (iid, aircraft_id, opened_at, completed_at, technician_id, created_at, updated_at),
         )
 
     # ---- Tasks ----
@@ -109,20 +130,36 @@ def seed() -> None:
     task_cursor = 0
     for i, iid in enumerate(inspection_ids):
         tasks_for_this = 3 if i < 3 else 2
-        is_completed = 1 if seeded_inspections[i][3] == 1 else 0
+        inspection_is_completed = 1 if seeded_inspections[i][3] == 1 else 0
 
         for _ in range(tasks_for_this):
             title = task_pool[task_cursor % len(task_pool)]
             task_cursor += 1
+
+            # If the inspection is completed, mark tasks complete and set completed_at.
+            # Otherwise leave them incomplete.
+            is_complete = inspection_is_completed
+            task_completed_at = created_at if is_complete == 1 else None
+
             cur.execute(
                 """
                 INSERT INTO tasks (
-                  id, inspection_id, title, is_completed, result, notes,
+                  id, inspection_id, title, description,
+                  is_complete, result, notes, completed_at,
                   created_at, updated_at, sync_status
                 )
-                VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, 'synced')
+                VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, 'synced')
                 """,
-                (str(uuid4()), iid, title, is_completed, created_at, updated_at),
+                (
+                    str(uuid4()),
+                    iid,
+                    title,
+                    None,               # description (optional)
+                    is_complete,
+                    task_completed_at,
+                    created_at,
+                    updated_at,
+                ),
             )
 
     conn.commit()
