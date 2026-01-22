@@ -80,10 +80,10 @@ def _fetch_row_by_id(table: str, row_id: str) -> Optional[Dict[str, Any]]:
 
 def _fetch_updated_since(table: str, since_ts: Optional[str], limit: int = 5000) -> List[Dict[str, Any]]:
     """
-    Return rows updated after `since_ts`. If since_ts is missing, return [] (no pull).
+    Return rows updated after `since_ts`.
+    If since_ts is missing/None, treat as first sync and return ALL rows (up to limit).
     """
-    if not since_ts:
-        return []
+    since = since_ts or "0000-01-01T00:00:00"
 
     with get_connection() as connection:
         rows = connection.execute(
@@ -94,7 +94,7 @@ def _fetch_updated_since(table: str, since_ts: Optional[str], limit: int = 5000)
             ORDER BY updated_at ASC
             LIMIT ?
             """,
-            (since_ts, limit),
+            (since, limit),
         ).fetchall()
 
     return [row_to_dict(r) for r in rows]
@@ -121,7 +121,7 @@ def _upsert_technician(incoming: Dict[str, Any]) -> Tuple[str, str]:
     tech_id = incoming.get("id")
     if not tech_id:
         return ("skipped", "")
-    
+
     if not incoming.get("username"):
         name = (incoming.get("name") or "").strip()
         if name:
@@ -259,10 +259,9 @@ def _upsert_task(incoming: Dict[str, Any]) -> Tuple[str, str]:
     task_id = incoming.get("id")
     if not task_id:
         return ("skipped", "")
-    
+
     if "is_complete" not in incoming and "is_completed" in incoming:
         incoming = {**incoming, "is_complete": incoming.get("is_completed")}
-
 
     server = _fetch_row_by_id("tasks", task_id)
     client_ts = _parse_ts(incoming.get("updated_at"))
@@ -332,6 +331,48 @@ def _upsert_task(incoming: Dict[str, Any]) -> Tuple[str, str]:
 
 
 # ----------------------------
+# NEW: Pull-only technicians sync
+# ----------------------------
+
+@app.route("/sync/technicians", methods=["POST"])
+@require_api_key
+def sync_technicians():
+    """
+    Pull-only reference sync for technicians_cache (server -> client).
+    Expected payload:
+    {
+      "client_id": "device-or-user-id",          // optional
+      "last_sync_at": "2026-01-19T10:00:00Z",    // optional; if missing, pull all
+      "limit": 5000                              // optional
+    }
+
+    Response:
+    {
+      "server_time": "...",
+      "technicians_cache": [ {...}, ... ]
+    }
+    """
+    payload = request.get_json(silent=True) or {}
+    last_sync_at = payload.get("last_sync_at")
+    limit = payload.get("limit") or 5000
+
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 5000
+
+    server_time = _now_iso()
+    tech_rows = _fetch_updated_since("technicians_cache", last_sync_at, limit=limit)
+
+    return jsonify(
+        {
+            "server_time": server_time,
+            "technicians_cache": tech_rows,
+        }
+    ), 200
+
+
+# ----------------------------
 # Sync endpoint: POST /sync/jobs
 # ----------------------------
 
@@ -376,13 +417,11 @@ def sync_jobs():
         "tasks": {"inserted": 0, "updated": 0, "skipped": 0, "conflict": 0},
     }
 
-    # NEW: IDs per outcome
     applied_ids = {
         "technicians_cache": {"inserted": [], "updated": [], "skipped": [], "conflict": []},
         "inspections": {"inserted": [], "updated": [], "skipped": [], "conflict": []},
         "tasks": {"inserted": [], "updated": [], "skipped": [], "conflict": []},
     }
-
 
     conflicts = {
         "technicians_cache": [],
@@ -402,7 +441,6 @@ def sync_jobs():
         if result == "conflict" and rid:
             conflicts["technicians_cache"].append(rid)
 
-
     for i in insp_changes:
         result, rid = _upsert_inspection(i or {})
         applied_summary["inspections"][result] += 1
@@ -412,7 +450,6 @@ def sync_jobs():
 
         if result == "conflict" and rid:
             conflicts["inspections"].append(rid)
-
 
     for tk in task_changes:
         result, rid = _upsert_task(tk or {})
@@ -424,18 +461,17 @@ def sync_jobs():
         if result == "conflict" and rid:
             conflicts["tasks"].append(rid)
 
-
-    # Pull server-side changes since last_sync_at 
+    # Pull server-side changes since last_sync_at
     server_changes = {
         "technicians_cache": _fetch_updated_since("technicians_cache", last_sync_at),
         "inspections": _fetch_updated_since("inspections", last_sync_at),
         "tasks": _fetch_updated_since("tasks", last_sync_at),
     }
 
-    data = request.get_json(silent=True)
-    print("RAW JSON:", data)
-    print("RAW BODY:", request.data)
-
+    # Legacy mapping: mirror task boolean field name if needed
+    for t in server_changes["tasks"]:
+        if "is_complete" in t and "is_completed" not in t:
+            t["is_completed"] = t["is_complete"]
 
     return jsonify(
         {
@@ -447,6 +483,7 @@ def sync_jobs():
             "server_changes": server_changes,
         }
     ), 200
+
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5050)
