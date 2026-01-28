@@ -4,19 +4,33 @@ from functools import wraps
 import sqlite3
 import os
 from typing import Any, Dict, Optional, List, Tuple
+
 from flask import Flask, jsonify, request
 
 
 # ----------------------------
-# Sync internals
+# Config
 # ----------------------------
 
 API_KEY = "api_warehouse_student_key_1234567890abcdef"
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "warehouse.db")
 
+# Where uploaded files are stored on the server filesystem
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# (Optional) basic upload size guard (bytes)
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25MB
+
+
 app = Flask(__name__)
 
+
+# ----------------------------
+# DB helpers
+# ----------------------------
 
 def get_connection() -> sqlite3.Connection:
     connection = sqlite3.connect(DB_PATH, isolation_level=None)  # autocommit
@@ -40,7 +54,6 @@ def require_api_key(func):
         if header_key != API_KEY and bearer_key != API_KEY:
             return jsonify({"error": "Unauthorized"}), 401
         return func(*args, **kwargs)
-
     return wrapper
 
 
@@ -55,7 +68,6 @@ def _parse_ts(ts: Optional[str]) -> datetime:
     if not ts or not isinstance(ts, str):
         return datetime.min
     s = ts.strip().replace("Z", "")
-    # sqlite CURRENT_TIMESTAMP uses space - ISO may use 'T'
     if " " in s and "T" not in s:
         s = s.replace(" ", "T", 1)
     try:
@@ -65,8 +77,12 @@ def _parse_ts(ts: Optional[str]) -> datetime:
 
 
 def _now_iso() -> str:
-    # Use ISO-ish text; consistent and sortable
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def _fetch_row_by_id(table: str, row_id: str) -> Optional[Dict[str, Any]]:
@@ -84,7 +100,6 @@ def _fetch_updated_since(table: str, since_ts: Optional[str], limit: int = 5000)
     If since_ts is missing/None, treat as first sync and return ALL rows (up to limit).
     """
     since = since_ts or "0000-01-01T00:00:00"
-
     with get_connection() as connection:
         rows = connection.execute(
             f"""
@@ -96,7 +111,6 @@ def _fetch_updated_since(table: str, since_ts: Optional[str], limit: int = 5000)
             """,
             (since, limit),
         ).fetchall()
-
     return [row_to_dict(r) for r in rows]
 
 
@@ -113,11 +127,11 @@ def _mark_conflict(table: str, row_id: str) -> None:
         )
 
 
+# ----------------------------
+# Upserts (client -> server)
+# ----------------------------
+
 def _upsert_technician(incoming: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    Returns (result, id) where result in: 'inserted'|'updated'|'skipped'|'conflict'
-    Conflict rule: if server.updated_at > client.updated_at => conflict.
-    """
     tech_id = incoming.get("id")
     if not tech_id:
         return ("skipped", "")
@@ -131,7 +145,6 @@ def _upsert_technician(incoming: Dict[str, Any]) -> Tuple[str, str]:
                 "display_name": incoming.get("display_name") or name,
             }
         else:
-            # Last-resort fallback to satisfy NOT NULL constraint
             incoming = {
                 **incoming,
                 "username": f"tech_{tech_id[:8]}",
@@ -168,7 +181,6 @@ def _upsert_technician(incoming: Dict[str, Any]) -> Tuple[str, str]:
             )
         return ("updated", tech_id)
 
-    # insert
     try:
         with get_connection() as connection:
             connection.execute(
@@ -188,7 +200,6 @@ def _upsert_technician(incoming: Dict[str, Any]) -> Tuple[str, str]:
             )
         return ("inserted", tech_id)
     except sqlite3.IntegrityError:
-        # username unique collision etc.
         return ("conflict", tech_id)
 
 
@@ -229,7 +240,6 @@ def _upsert_inspection(incoming: Dict[str, Any]) -> Tuple[str, str]:
             )
         return ("updated", insp_id)
 
-    # insert
     try:
         with get_connection() as connection:
             connection.execute(
@@ -251,7 +261,6 @@ def _upsert_inspection(incoming: Dict[str, Any]) -> Tuple[str, str]:
             )
         return ("inserted", insp_id)
     except sqlite3.IntegrityError:
-        # FK technician_id missing, invalid status check, etc.
         return ("conflict", insp_id)
 
 
@@ -260,6 +269,7 @@ def _upsert_task(incoming: Dict[str, Any]) -> Tuple[str, str]:
     if not task_id:
         return ("skipped", "")
 
+    # Accept either is_complete or is_completed from client
     if "is_complete" not in incoming and "is_completed" in incoming:
         incoming = {**incoming, "is_complete": incoming.get("is_completed")}
 
@@ -301,7 +311,6 @@ def _upsert_task(incoming: Dict[str, Any]) -> Tuple[str, str]:
             )
         return ("updated", task_id)
 
-    # insert
     try:
         with get_connection() as connection:
             connection.execute(
@@ -326,32 +335,178 @@ def _upsert_task(incoming: Dict[str, Any]) -> Tuple[str, str]:
             )
         return ("inserted", task_id)
     except sqlite3.IntegrityError:
-        # FK inspection_id missing, etc.
         return ("conflict", task_id)
 
 
+def _upsert_attachment(incoming: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Attachments are metadata rows that reference a blob already uploaded
+    (remote_key returned by /attachments/upload).
+
+    Returns (result, id) where result in: inserted|updated|skipped|conflict
+
+    Rules:
+      - If missing required fields OR remote_key missing: skipped
+        (so client remains 'pending' and will retry upload next sync)
+      - Conflict rule: if server.updated_at > client.updated_at => conflict
+      - Enforces 1 attachment per task via task_id UNIQUE; collisions => conflict
+    """
+    att_id = incoming.get("id")
+    if not att_id:
+        return ("skipped", "")
+
+    task_id = (incoming.get("task_id") or "").strip()
+    file_name = (incoming.get("file_name") or "").strip()
+    mime_type = (incoming.get("mime_type") or "").strip()
+
+    # IMPORTANT: central schema has remote_key NOT NULL
+    remote_key = (incoming.get("remote_key") or "").strip()
+
+    # If the blob hasn't been uploaded yet, don't insert metadata yet.
+    if not task_id or not file_name or not mime_type or not remote_key:
+        return ("skipped", "")
+
+    try:
+        size_bytes = int(incoming.get("size_bytes") or 0)
+    except (TypeError, ValueError):
+        size_bytes = 0
+
+    server = _fetch_row_by_id("attachments", att_id)
+    client_ts = _parse_ts(incoming.get("updated_at"))
+
+    if server:
+        server_ts = _parse_ts(server.get("updated_at"))
+        if server_ts > client_ts:
+            _mark_conflict("attachments", att_id)
+            return ("conflict", att_id)
+
+        try:
+            with get_connection() as connection:
+                connection.execute(
+                    """
+                    UPDATE attachments
+                    SET task_id = ?,
+                        file_name = ?,
+                        mime_type = ?,
+                        size_bytes = ?,
+                        sha256 = ?,
+                        remote_key = ?,
+                        updated_at = ?,
+                        sync_status = 'synced'
+                    WHERE id = ?
+                    """,
+                    (
+                        task_id,
+                        file_name,
+                        mime_type,
+                        size_bytes,
+                        incoming.get("sha256"),
+                        remote_key,
+                        incoming.get("updated_at") or _now_iso(),
+                        att_id,
+                    ),
+                )
+            return ("updated", att_id)
+        except sqlite3.IntegrityError:
+            # unique(task_id) collision or FK task missing
+            return ("conflict", att_id)
+
+    # insert
+    try:
+        with get_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO attachments
+                    (id, task_id, file_name, mime_type, size_bytes, sha256, remote_key,
+                     created_at, updated_at, sync_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'synced')
+                """,
+                (
+                    att_id,
+                    task_id,
+                    file_name,
+                    mime_type,
+                    size_bytes,
+                    incoming.get("sha256"),
+                    remote_key,
+                    incoming.get("created_at") or _now_iso(),
+                    incoming.get("updated_at") or _now_iso(),
+                ),
+            )
+        return ("inserted", att_id)
+    except sqlite3.IntegrityError:
+        return ("conflict", att_id)
+
+
 # ----------------------------
-# NEW: Pull-only technicians sync
+# NEW: Blob upload endpoint
+# ----------------------------
+
+@app.route("/attachments/upload", methods=["POST"])
+@require_api_key
+def upload_attachment():
+    """
+    Expected multipart/form-data:
+      - fields:
+          attachment_id: <uuid/string>   (required)
+          client_id: <string>            (optional)
+      - file:
+          name "file"                    (required)
+
+    Response JSON (what your Flutter SyncService expects):
+      { "attachment_id": "...", "remote_key": "..." }
+
+    Notes:
+      - This endpoint ONLY stores the blob on disk and returns remote_key.
+      - The metadata row is created/updated later during /sync/jobs using that remote_key.
+    """
+    attachment_id = (request.form.get("attachment_id") or "").strip()
+    if not attachment_id:
+        return jsonify({"error": "attachment_id is required"}), 400
+
+    if "file" not in request.files:
+        return jsonify({"error": "file is required"}), 400
+
+    f = request.files["file"]
+    if not f or f.filename is None:
+        return jsonify({"error": "invalid file"}), 400
+
+    # basic size guard (best-effort; relies on Content-Length)
+    try:
+        content_length = request.content_length or 0
+        if content_length > MAX_UPLOAD_BYTES:
+            return jsonify({"error": "File too large"}), 413
+    except Exception:
+        pass
+
+    original_name = os.path.basename(f.filename)  # strip paths
+    _, ext = os.path.splitext(original_name)
+    ext = ext[:12]  # small safety
+
+    # Keep it simple and deterministic:
+    # store as uploads/<attachment_id><ext>
+    filename = f"{attachment_id}{ext}"
+    abs_path = os.path.join(UPLOAD_DIR, filename)
+
+    try:
+        f.save(abs_path)
+    except Exception as e:
+        return jsonify({"error": f"failed to save file: {e}"}), 500
+
+    # remote_key is what the client stores in its attachments.remoteKey column
+    # and later sends via /sync/jobs
+    remote_key = filename
+
+    return jsonify({"attachment_id": attachment_id, "remote_key": remote_key}), 200
+
+
+# ----------------------------
+# Pull-only technicians sync
 # ----------------------------
 
 @app.route("/sync/technicians", methods=["POST"])
 @require_api_key
 def sync_technicians():
-    """
-    Pull-only reference sync for technicians_cache (server -> client).
-    Expected payload:
-    {
-      "client_id": "device-or-user-id",          // optional
-      "last_sync_at": "2026-01-19T10:00:00Z",    // optional; if missing, pull all
-      "limit": 5000                              // optional
-    }
-
-    Response:
-    {
-      "server_time": "...",
-      "technicians_cache": [ {...}, ... ]
-    }
-    """
     payload = request.get_json(silent=True) or {}
     last_sync_at = payload.get("last_sync_at")
     limit = payload.get("limit") or 5000
@@ -364,12 +519,7 @@ def sync_technicians():
     server_time = _now_iso()
     tech_rows = _fetch_updated_since("technicians_cache", last_sync_at, limit=limit)
 
-    return jsonify(
-        {
-            "server_time": server_time,
-            "technicians_cache": tech_rows,
-        }
-    ), 200
+    return jsonify({"server_time": server_time, "technicians_cache": tech_rows}), 200
 
 
 # ----------------------------
@@ -379,27 +529,6 @@ def sync_technicians():
 @app.route("/sync/jobs", methods=["POST"])
 @require_api_key
 def sync_jobs():
-    """
-    Expected payload (flexible, but recommended):
-    {
-      "client_id": "device-or-user-id",
-      "last_sync_at": "2026-01-19T10:00:00Z",   // optional: used for pulling server changes
-      "changes": {
-        "technicians_cache": [ {...}, ... ],
-        "inspections": [ {...}, ... ],
-        "tasks": [ {...}, ... ]
-      }
-    }
-
-    Response:
-    {
-      "job_id": "...",
-      "server_time": "...",
-      "applied": { "technicians_cache": {...}, "inspections": {...}, "tasks": {...} },
-      "conflicts": { "technicians_cache": [...], "inspections": [...], "tasks": [...] },
-      "server_changes": { "technicians_cache": [...], "inspections": [...], "tasks": [...] }
-    }
-    """
     payload = request.get_json(silent=True) or {}
     last_sync_at = payload.get("last_sync_at")
     changes = payload.get("changes") or {}
@@ -407,6 +536,7 @@ def sync_jobs():
     tech_changes = changes.get("technicians_cache") or []
     insp_changes = changes.get("inspections") or []
     task_changes = changes.get("tasks") or []
+    att_changes = changes.get("attachments") or []  # NEW
 
     job_id = str(uuid4())
     server_time = _now_iso()
@@ -415,57 +545,63 @@ def sync_jobs():
         "technicians_cache": {"inserted": 0, "updated": 0, "skipped": 0, "conflict": 0},
         "inspections": {"inserted": 0, "updated": 0, "skipped": 0, "conflict": 0},
         "tasks": {"inserted": 0, "updated": 0, "skipped": 0, "conflict": 0},
+        "attachments": {"inserted": 0, "updated": 0, "skipped": 0, "conflict": 0},  # NEW
     }
 
     applied_ids = {
         "technicians_cache": {"inserted": [], "updated": [], "skipped": [], "conflict": []},
         "inspections": {"inserted": [], "updated": [], "skipped": [], "conflict": []},
         "tasks": {"inserted": [], "updated": [], "skipped": [], "conflict": []},
+        "attachments": {"inserted": [], "updated": [], "skipped": [], "conflict": []},  # NEW
     }
 
     conflicts = {
         "technicians_cache": [],
         "inspections": [],
         "tasks": [],
+        "attachments": [],  # NEW
     }
 
     # Apply in FK-safe order:
-    # technicians -> inspections -> tasks
+    # technicians -> inspections -> tasks -> attachments
     for t in tech_changes:
         result, rid = _upsert_technician(t or {})
         applied_summary["technicians_cache"][result] += 1
-
         if rid:
             applied_ids["technicians_cache"][result].append(rid)
-
         if result == "conflict" and rid:
             conflicts["technicians_cache"].append(rid)
 
     for i in insp_changes:
         result, rid = _upsert_inspection(i or {})
         applied_summary["inspections"][result] += 1
-
         if rid:
             applied_ids["inspections"][result].append(rid)
-
         if result == "conflict" and rid:
             conflicts["inspections"].append(rid)
 
     for tk in task_changes:
         result, rid = _upsert_task(tk or {})
         applied_summary["tasks"][result] += 1
-
         if rid:
             applied_ids["tasks"][result].append(rid)
-
         if result == "conflict" and rid:
             conflicts["tasks"].append(rid)
+
+    for a in att_changes:
+        result, rid = _upsert_attachment(a or {})
+        applied_summary["attachments"][result] += 1
+        if rid:
+            applied_ids["attachments"][result].append(rid)
+        if result == "conflict" and rid:
+            conflicts["attachments"].append(rid)
 
     # Pull server-side changes since last_sync_at
     server_changes = {
         "technicians_cache": _fetch_updated_since("technicians_cache", last_sync_at),
         "inspections": _fetch_updated_since("inspections", last_sync_at),
         "tasks": _fetch_updated_since("tasks", last_sync_at),
+        "attachments": _fetch_updated_since("attachments", last_sync_at),  # NEW
     }
 
     # Legacy mapping: mirror task boolean field name if needed
