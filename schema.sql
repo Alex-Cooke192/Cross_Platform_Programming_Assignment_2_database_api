@@ -56,3 +56,30 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_inspection_id ON tasks(inspection_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_complete ON tasks(is_complete);
+
+-- Attachments (1 attachment per task)
+-- Stores metadata + server storage key/path (NOT raw bytes)
+
+CREATE TABLE IF NOT EXISTS attachments (
+    id TEXT PRIMARY KEY,                 -- UUID (matches client attachment id)
+    task_id TEXT NOT NULL UNIQUE,         -- enforce max-1 attachment per task
+
+    file_name TEXT NOT NULL,              -- original name from client
+    mime_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+
+    sha256 TEXT,                          -- optional (if you compute it)
+    remote_key TEXT NOT NULL,             -- where the blob is stored on server (path/key)
+
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    -- sync metadata (optional for central, but keeps model consistent)
+    sync_status TEXT NOT NULL DEFAULT 'synced',
+    CHECK (sync_status IN ('synced', 'pending', 'conflict')),
+
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_attachments_task_id ON attachments(task_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_remote_key ON attachments(remote_key);
